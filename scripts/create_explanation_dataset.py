@@ -7,6 +7,7 @@ import torch
 import csv
 import re
 import json
+from collections import namedtuple
 
 # ==============================================================================
 # ==============================================================================
@@ -36,17 +37,40 @@ MIN_SOURCE_OVERLAP = 0.12
 MIN_QUALITY_SCORE = 0.35
 PROGRESS_SAVE_EVERY = 100
 
+LAMBDA_SOURCE_OVERLAP = 1.8
+LAMBDA_DIVERSITY = 0.8
+LAMBDA_REPETITION = 1.2
+
+QualityMetrics = namedtuple(
+    "QualityMetrics",
+    ["score", "source_overlap", "diversity", "repeat_ratio", "token_len"],
+)
+
 EXPLANATION_PROMPT_TEMPLATE = """Task: Write one faithful recommendation explanation.
 
 Rules:
-1) Use only facts from User History.
+1) Use only evidence from User History and Recommended Item.
 2) Do not invent preferences, events, or attributes.
-3) If history evidence is weak, say uncertainty briefly.
+3) If the evidence is weak, say uncertainty briefly.
 4) Keep it concise (1-2 sentences).
 
 User History: {history}
 Recommended Item: {item}
 Explanation:"""
+
+OUTPUT_COLUMNS = [
+    "raw_index",
+    "user_id",
+    "history",
+    "recommended_item",
+    "explanation",
+    "quality_score",
+    "source_overlap",
+    "lexical_diversity",
+    "repeat_ratio",
+    "explanation_tokens",
+    "candidate_source",
+]
 
 # ==============================================================================
 # ==============================================================================
@@ -85,40 +109,48 @@ def tokenize_words(text):
     return re.findall(r"[a-zA-Z0-9]+", str(text).lower())
 
 
-def compute_quality(explanation, history, target):
+def build_evidence_source(history, target):
+    return f"{history}\n{target}"
+
+
+def compute_quality(explanation, source_text):
     """
-    Quality score = source overlap + diversity - repetition penalty.
-    Used to filter hallucinated or templated repetitive explanations.
+    Q(E;S) = source overlap + lexical diversity - repetition penalty.
+    Source overlap is a lightweight grounding proxy, not a factual verifier.
     """
     tokens = tokenize_words(explanation)
     if not tokens:
-        return -1.0, 0.0, 1.0, 0
+        return QualityMetrics(-1.0, 0.0, 0.0, 1.0, 0)
 
-    src_tokens = set(tokenize_words(history) + tokenize_words(target))
+    src_tokens = set(tokenize_words(source_text))
     overlap_hits = sum(1 for tok in tokens if tok in src_tokens)
     overlap_ratio = overlap_hits / len(tokens)
 
-    unique_ratio = len(set(tokens)) / len(tokens)
-    repeat_ratio = 1.0 - unique_ratio
+    diversity = len(set(tokens)) / len(tokens)
+    repeat_ratio = 1.0 - diversity
 
-    score = overlap_ratio * 1.8 + unique_ratio * 0.8 - repeat_ratio * 1.2
-    return score, overlap_ratio, repeat_ratio, len(tokens)
+    score = (
+        LAMBDA_SOURCE_OVERLAP * overlap_ratio
+        + LAMBDA_DIVERSITY * diversity
+        - LAMBDA_REPETITION * repeat_ratio
+    )
+    return QualityMetrics(score, overlap_ratio, diversity, repeat_ratio, len(tokens))
 
 
-def is_good_explanation(score, overlap_ratio, repeat_ratio, token_len):
-    if token_len < MIN_EXPLANATION_TOKENS or token_len > MAX_EXPLANATION_TOKENS:
+def is_good_explanation(metrics):
+    if metrics.token_len < MIN_EXPLANATION_TOKENS or metrics.token_len > MAX_EXPLANATION_TOKENS:
         return False
-    if overlap_ratio < MIN_SOURCE_OVERLAP:
+    if metrics.source_overlap < MIN_SOURCE_OVERLAP:
         return False
-    if repeat_ratio > MAX_REPEAT_RATIO:
+    if metrics.repeat_ratio > MAX_REPEAT_RATIO:
         return False
-    if score < MIN_QUALITY_SCORE:
+    if metrics.score < MIN_QUALITY_SCORE:
         return False
     return True
 
 
-def generate_explanation(prompt, history, target):
-    """Generate an explanation via candidate reranking to reduce hallucination and repetition."""
+def generate_explanation(prompt, source_text):
+    """Generate an Oracle pseudo-label via candidate reranking and beam fallback."""
     try:
         inputs = tokenizer(
             prompt, 
@@ -141,14 +173,15 @@ def generate_explanation(prompt, history, target):
         sampled_candidates = tokenizer.batch_decode(sampled_outputs, skip_special_tokens=True)
 
         best_text = ""
-        best_metrics = (-1.0, 0.0, 1.0, 0)
+        best_metrics = QualityMetrics(-1.0, 0.0, 0.0, 1.0, 0)
+        best_source = "sample"
         for cand in sampled_candidates:
-            metrics = compute_quality(cand, history, target)
-            if metrics[0] > best_metrics[0]:
+            metrics = compute_quality(cand, source_text)
+            if metrics.score > best_metrics.score:
                 best_text = cand
                 best_metrics = metrics
 
-        if not is_good_explanation(*best_metrics):
+        if not is_good_explanation(best_metrics):
             beam_outputs = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
@@ -159,15 +192,16 @@ def generate_explanation(prompt, history, target):
                 eos_token_id=tokenizer.eos_token_id,
             )
             beam_text = tokenizer.decode(beam_outputs[0], skip_special_tokens=True)
-            beam_metrics = compute_quality(beam_text, history, target)
-            if beam_metrics[0] > best_metrics[0]:
+            beam_metrics = compute_quality(beam_text, source_text)
+            if beam_metrics.score > best_metrics.score:
                 best_text = beam_text
                 best_metrics = beam_metrics
+                best_source = "beam"
 
-        return best_text, best_metrics
+        return best_text, best_metrics, best_source
     except Exception as e:
         print(f"\n!!! Model inference error: {e}")
-        return "Error: Generation failed.", (-1.0, 0.0, 1.0, 0)
+        return "Error: Generation failed.", QualityMetrics(-1.0, 0.0, 0.0, 1.0, 0), "error"
 
 # ==============================================================================
 # ==============================================================================
@@ -191,7 +225,19 @@ def main():
             continue
 
         start_index = 0
-        if os.path.exists(progress_path):
+        schema_matches = True
+        if os.path.exists(output_path):
+            try:
+                existing_header = list(pd.read_csv(output_path, nrows=0).columns)
+                schema_matches = existing_header == OUTPUT_COLUMNS
+                if not schema_matches:
+                    print("Existing output schema differs from the current Oracle pseudo-label schema.")
+                    print("Regenerating this split from raw data to avoid mixed-format rows.")
+            except Exception:
+                schema_matches = False
+                print("Existing output header cannot be read. Regenerating this split from raw data.")
+
+        if schema_matches and os.path.exists(progress_path):
             try:
                 with open(progress_path, "r", encoding="utf-8") as pf:
                     progress_state = json.load(pf)
@@ -200,7 +246,7 @@ def main():
             except Exception:
                 start_index = 0
                 print("Progress file is corrupted. Restarting from the beginning.")
-        elif os.path.exists(output_path):
+        elif schema_matches and os.path.exists(output_path):
             try:
                 existing_df = pd.read_csv(output_path, usecols=["raw_index"])
                 if len(existing_df) > 0:
@@ -219,17 +265,7 @@ def main():
             writer = csv.writer(f)
             
             if start_index == 0:
-                writer.writerow([
-                    "raw_index",
-                    "user_id",
-                    "history",
-                    "recommended_item",
-                    "explanation",
-                    "quality_score",
-                    "source_overlap",
-                    "repeat_ratio",
-                    "explanation_tokens"
-                ])
+                writer.writerow(OUTPUT_COLUMNS)
 
             for raw_idx in tqdm(range(start_index, len(df)), initial=start_index, total=len(df), desc=f"Generating for {split}"):
                 row = df.iloc[raw_idx]
@@ -238,13 +274,13 @@ def main():
                 user_id = row.get('user_id', 1)
                 
                 prompt_text = EXPLANATION_PROMPT_TEMPLATE.format(history=history, item=target)
-                explanation_text, metrics = generate_explanation(prompt_text, history, target)
-                score, overlap_ratio, repeat_ratio, token_len = metrics
+                source_text = build_evidence_source(history, target)
+                explanation_text, metrics, candidate_source = generate_explanation(prompt_text, source_text)
 
                 should_write = True
                 if "Error:" in explanation_text or explanation_text.strip() == "":
                     should_write = False
-                if should_write and not is_good_explanation(score, overlap_ratio, repeat_ratio, token_len):
+                if should_write and not is_good_explanation(metrics):
                     should_write = False
 
                 if should_write:
@@ -254,10 +290,12 @@ def main():
                         history,
                         target,
                         explanation_text,
-                        round(score, 4),
-                        round(overlap_ratio, 4),
-                        round(repeat_ratio, 4),
-                        token_len
+                        round(metrics.score, 4),
+                        round(metrics.source_overlap, 4),
+                        round(metrics.diversity, 4),
+                        round(metrics.repeat_ratio, 4),
+                        metrics.token_len,
+                        candidate_source
                     ])
                     split_kept += 1
                 else:

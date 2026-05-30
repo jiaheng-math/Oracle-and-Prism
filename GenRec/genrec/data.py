@@ -16,12 +16,20 @@ GenBatch = namedtuple('GenBatch', field_names=gen_batch_fields, defaults=[None] 
 
 USER_VOCAB_SIZE = 331845
 ITEM_VOCAB_SIZE = 103912
+LAMBDA_SOURCE_OVERLAP = 1.8
+LAMBDA_DIVERSITY = 0.8
+LAMBDA_REPETITION = 1.2
+QualityMetrics = namedtuple(
+    "QualityMetrics",
+    ["score", "source_overlap", "diversity", "repeat_ratio", "token_len"],
+)
+
 PROMPT_TEMPLATE = """Task: Write one faithful recommendation explanation.
 
 Rules:
-1) Use only facts from User History.
+1) Use only evidence from User History and Recommended Item.
 2) Do not invent preferences, events, or attributes.
-3) If history evidence is weak, say uncertainty briefly.
+3) If the evidence is weak, say uncertainty briefly.
 4) Keep it concise (1-2 sentences).
 
 User History: {history}
@@ -75,15 +83,24 @@ def _tokens(text):
     return re.findall(r"[a-zA-Z0-9]+", str(text).lower())
 
 
+def _evidence_source(history, item):
+    return f"{history}\n{item}"
+
+
 def _pseudo_label_quality(source_text, target_text):
     tgt_tokens = _tokens(target_text)
     if not tgt_tokens:
-        return 0.0, 0.0, 1.0, 0
+        return QualityMetrics(0.0, 0.0, 0.0, 1.0, 0)
     src_tokens = set(_tokens(source_text))
     overlap = sum(1 for tok in tgt_tokens if tok in src_tokens) / len(tgt_tokens)
-    unique_ratio = len(set(tgt_tokens)) / len(tgt_tokens)
-    repeat_ratio = 1.0 - unique_ratio
-    return overlap * 1.8 + unique_ratio * 0.8 - repeat_ratio * 1.2, overlap, repeat_ratio, len(tgt_tokens)
+    diversity = len(set(tgt_tokens)) / len(tgt_tokens)
+    repeat_ratio = 1.0 - diversity
+    score = (
+        LAMBDA_SOURCE_OVERLAP * overlap
+        + LAMBDA_DIVERSITY * diversity
+        - LAMBDA_REPETITION * repeat_ratio
+    )
+    return QualityMetrics(score, overlap, diversity, repeat_ratio, len(tgt_tokens))
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -155,17 +172,18 @@ class Dataset(torch.utils.data.Dataset):
 
             source_text = PROMPT_TEMPLATE.format(history=history, item=item)
             if self.filter_pseudo_labels:
-                score, overlap, repeat_ratio, token_len = _pseudo_label_quality(source_text, explanation)
-                if token_len < self.min_target_tokens or token_len > self.max_target_tokens:
+                evidence_text = _evidence_source(history, item)
+                metrics = _pseudo_label_quality(evidence_text, explanation)
+                if metrics.token_len < self.min_target_tokens or metrics.token_len > self.max_target_tokens:
                     filtered_count += 1
                     continue
-                if repeat_ratio > self.max_target_repeat_ratio:
+                if metrics.repeat_ratio > self.max_target_repeat_ratio:
                     filtered_count += 1
                     continue
-                if overlap < self.min_source_overlap:
+                if metrics.source_overlap < self.min_source_overlap:
                     filtered_count += 1
                     continue
-                if score < self.min_quality_score:
+                if metrics.score < self.min_quality_score:
                     filtered_count += 1
                     continue
 
